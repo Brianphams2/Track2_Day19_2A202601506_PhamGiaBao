@@ -8,6 +8,7 @@ JUPYTER  := $(VENV)/bin/jupyter
 JUPYTEXT := $(VENV)/bin/jupytext
 UVICORN  := $(VENV)/bin/uvicorn
 PYTEST   := $(VENV)/bin/pytest
+ALLOW_ROOT := $(shell if [ "$$(id -u)" = "0" ]; then echo --allow-root; fi)
 
 .DEFAULT_GOAL := help
 
@@ -33,12 +34,12 @@ api: ## [lite] Start FastAPI /search on http://localhost:8000
 
 lab: ## [lite] Open Jupyter Lab on http://localhost:8888
 	@$(JUPYTEXT) --to notebook --update notebooks/[0-9]*.py 2>/dev/null || true
-	@$(JUPYTER) lab --notebook-dir=notebooks --ServerApp.token='' --no-browser
+	@$(JUPYTER) lab --notebook-dir=notebooks --ServerApp.token='' --no-browser $(ALLOW_ROOT)
 
 benchmark: ## [both] Precision@10 (keyword/semantic/hybrid) + P99 latency table
 	@$(PY) scripts/benchmark.py
 
-test: ## [both] Run pytest (app + scripts)
+test: ## [both] Run all pytest tests
 	@$(PYTEST) -q
 
 gen-advanced: ## [both] Generate data for the advanced missions (NB6 + NB8)
@@ -46,13 +47,16 @@ gen-advanced: ## [both] Generate data for the advanced missions (NB6 + NB8)
 	@$(PY) scripts/gen_spend.py
 
 notebooks: ## [both] Execute ALL notebooks headless (what the grader runs)
-	@$(JUPYTEXT) --to notebook --update notebooks/[0-9]*.py >/dev/null 2>&1 || true
-	@for nb in notebooks/[0-9]*.ipynb; do \
+	@set -e; \
+	$(JUPYTEXT) --to notebook --update notebooks/[0-9]*.py >/dev/null 2>&1; \
+	failed=0; \
+	for nb in notebooks/[0-9]*.ipynb; do \
 		printf '%-42s' "$$nb"; \
-		PATH="$(PWD)/$(VENV)/bin:$$PATH" $(VENV)/bin/jupyter nbconvert --to notebook \
+		if PATH="$(PWD)/$(VENV)/bin:$$PATH" $(VENV)/bin/jupyter nbconvert --to notebook \
 			--execute --inplace "$$nb" --ExecutePreprocessor.timeout=900 \
-			>/dev/null 2>&1 && echo PASS || echo FAIL; \
-	done
+			>/dev/null 2>&1; then echo PASS; else echo FAIL; failed=1; fi; \
+	done; \
+	exit $$failed
 
 clean-lite: ## [lite] Wipe venv + data + Feast registry
 	rm -rf $(VENV) data/corpus_vn.jsonl data/golden_set.jsonl data/qdrant_storage \

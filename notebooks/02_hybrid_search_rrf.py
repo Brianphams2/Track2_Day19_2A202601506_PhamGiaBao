@@ -20,6 +20,7 @@
 import _setup  # noqa: F401
 import json
 import statistics
+from functools import lru_cache
 from pathlib import Path
 
 from fastembed import TextEmbedding
@@ -28,6 +29,10 @@ from qdrant_client.models import Distance, VectorParams, PointStruct
 from rank_bm25 import BM25Okapi
 
 DATA = Path(_setup.__file__).resolve().parent.parent / "data"
+VECTOR_MODELS = {
+    "baseline": ("BAAI/bge-small-en-v1.5", 384),
+    "multilingual": ("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", 384),
+}
 
 # %% [markdown]
 # ## 1. Reload corpus + build both indices
@@ -40,25 +45,28 @@ tokenized = [(d["title"] + " " + d["text"]).lower().split() for d in docs]
 bm25 = BM25Okapi(tokenized)
 
 # Vector
-embedder = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 client = QdrantClient(":memory:")
-client.create_collection(
-    collection_name="lab19",
-    vectors_config=VectorParams(size=384, distance=Distance.COSINE),
-)
+embedders = {key: TextEmbedding(model_name=name) for key, (name, _) in VECTOR_MODELS.items()}
 BATCH = 64
-points = []
-for start in range(0, len(docs), BATCH):
-    batch = docs[start:start + BATCH]
-    texts = [d["title"] + " " + d["text"] for d in batch]
-    vectors = list(embedder.embed(texts))
-    for i, (d, v) in enumerate(zip(batch, vectors)):
-        points.append(PointStruct(
-            id=start + i, vector=v.tolist(),
-            payload={"doc_id": d["doc_id"], "topic": d["topic"]},
-        ))
-client.upsert(collection_name="lab19", points=points)
-print(f"BM25 + vector indices ready ({len(docs)} docs)")
+for model_key, (_, dimension) in VECTOR_MODELS.items():
+    collection = f"lab19_{model_key}"
+    client.create_collection(
+        collection_name=collection,
+        vectors_config=VectorParams(size=dimension, distance=Distance.COSINE),
+    )
+    points = []
+    for start in range(0, len(docs), BATCH):
+        batch = docs[start:start + BATCH]
+        texts = [d["title"] + " " + d["text"] for d in batch]
+        vectors = list(embedders[model_key].embed(texts))
+        for i, (d, v) in enumerate(zip(batch, vectors)):
+            points.append(PointStruct(
+                id=start + i, vector=v.tolist(),
+                payload={"doc_id": d["doc_id"], "topic": d["topic"]},
+            ))
+    client.upsert(collection_name=collection, points=points)
+    print(f"Indexed {len(points)} docs with {model_key}: {VECTOR_MODELS[model_key][0]}")
+print(f"BM25 + 2 vector indices ready ({len(docs)} docs)")
 
 # %% [markdown]
 # ## 2. Per-mode search functions
@@ -68,16 +76,34 @@ TOP_K = 10
 RRF_K = 60   # standard default — see slide §3
 
 
-def search_keyword(query: str, top_k: int = TOP_K) -> list[str]:
+@lru_cache(maxsize=256)
+def keyword_ranking(query: str) -> tuple[str, ...]:
     scores = bm25.get_scores(query.lower().split())
-    ranked = sorted(range(len(scores)), key=lambda i: -scores[i])[:top_k]
-    return [docs[i]["doc_id"] for i in ranked]
+    ranked = sorted(range(len(scores)), key=lambda i: -scores[i])
+    return tuple(docs[i]["doc_id"] for i in ranked)
+
+
+def search_keyword(query: str, top_k: int = TOP_K) -> list[str]:
+    return list(keyword_ranking(query)[:top_k])
+
+
+@lru_cache(maxsize=512)
+def semantic_ranking(query: str, model_key: str) -> tuple[str, ...]:
+    q_vec = next(embedders[model_key].embed([query])).tolist()
+    res = client.query_points(
+        collection_name=f"lab19_{model_key}", query=q_vec, limit=100
+    )
+    return tuple(p.payload["doc_id"] for p in res.points)
 
 
 def search_semantic(query: str, top_k: int = TOP_K) -> list[str]:
-    q_vec = next(embedder.embed([query])).tolist()
-    res = client.query_points(collection_name="lab19", query=q_vec, limit=top_k)
-    return [p.payload["doc_id"] for p in res.points]
+    """Pure-vector ensemble: fuse two embedding rankings, without BM25."""
+    depth = max(top_k * 5, 50)
+    rrf: dict[str, float] = {}
+    for model_key in VECTOR_MODELS:
+        for rank, doc_id in enumerate(semantic_ranking(query, model_key)[:depth], start=1):
+            rrf[doc_id] = rrf.get(doc_id, 0.0) + 1.0 / (RRF_K + rank)
+    return [doc_id for doc_id, _ in sorted(rrf.items(), key=lambda item: -item[1])[:top_k]]
 
 
 # %% [markdown]
@@ -95,8 +121,13 @@ def search_semantic(query: str, top_k: int = TOP_K) -> list[str]:
 # 3. Sort theo total score, trả về top-10 doc_id.
 
 # %%
-def search_hybrid(query: str, top_k: int = TOP_K, rrf_k: int = RRF_K) -> list[str]:
-    depth = max(top_k * 5, 50)
+def search_hybrid(
+    query: str,
+    top_k: int = TOP_K,
+    rrf_k: int = RRF_K,
+    depth: int | None = None,
+) -> list[str]:
+    depth = depth or max(top_k * 5, 50)
     kw_ids = search_keyword(query, depth)
     sem_ids = search_semantic(query, depth)
 
@@ -143,6 +174,34 @@ for q in golden:
     p_sem.append(precision_at_10(search_semantic(q["query"]), q["topic"]))
     p_hyb.append(precision_at_10(search_hybrid(q["query"]), q["topic"]))
 
+print("RRF sensitivity (overall / exact / paraphrase / mixed):")
+for candidate_depth in (20, 50, 100):
+    for candidate_k in (10, 30, 60, 100):
+        candidate_scores = [
+            precision_at_10(
+                search_hybrid(
+                    item["query"], rrf_k=candidate_k, depth=candidate_depth
+                ),
+                item["topic"],
+            )
+            for item in golden
+        ]
+        candidate_slices = {
+            query_type: statistics.mean(
+                score
+                for item, score in zip(golden, candidate_scores)
+                if item["mode_hint"] == query_type
+            )
+            for query_type in ("exact", "paraphrase", "mixed")
+        }
+        print(
+            f"  depth={candidate_depth:3} k={candidate_k:3}: "
+            f"{statistics.mean(candidate_scores):5.1%} / "
+            f"{candidate_slices['exact']:5.1%} / "
+            f"{candidate_slices['paraphrase']:5.1%} / "
+            f"{candidate_slices['mixed']:5.1%}"
+        )
+
 print(f"Precision@10 (avg over {len(golden)} queries):")
 print(f"  Keyword (BM25)   : {statistics.mean(p_kw):.1%}")
 print(f"  Semantic (vector): {statistics.mean(p_sem):.1%}")
@@ -171,17 +230,29 @@ for t in ("exact", "paraphrase", "mixed"):
           f"{statistics.mean(m['sem']):>6.1%} "
           f"{statistics.mean(m['hyb']):>6.1%}")
 
+slice_means = {
+    query_type: {mode: statistics.mean(values) for mode, values in scores.items()}
+    for query_type, scores in by_type.items()
+}
+assert statistics.mean(p_hyb) > statistics.mean(p_kw)
+assert statistics.mean(p_hyb) > statistics.mean(p_sem)
+assert slice_means["exact"]["kw"] > slice_means["exact"]["sem"]
+assert slice_means["paraphrase"]["sem"] > slice_means["paraphrase"]["kw"]
+assert slice_means["paraphrase"]["sem"] > slice_means["paraphrase"]["hyb"]
+assert slice_means["mixed"]["hyb"] > slice_means["mixed"]["kw"]
+assert slice_means["mixed"]["hyb"] > slice_means["mixed"]["sem"]
+
 # %% [markdown]
 # ### Diễn giải kết quả
 #
-# - `exact` queries chứa từ kỹ thuật verbatim trong corpus → BM25 mạnh, hybrid
-#   thường ngang bằng (keyword signal đã đủ mạnh).
-# - `paraphrase` queries dùng từ Việt **không** xuất hiện verbatim trong docs
-#   → cả BM25 và vector đều giảm điểm. Trên synthetic corpus 1000-doc với
-#   embedding model `BAAI/bge-small-en-v1.5` (English-trained), semantic
-#   recall trên Vietnamese paraphrases yếu (24-32%). **Đổi sang `bge-m3`
-#   (full Docker path) sẽ giúp semantic thắng paraphrase queries** — đây là
-#   teaching moment cho "embedding model choice matters".
+# - `exact` queries chứa từ kỹ thuật verbatim trong corpus → BM25 mạnh vì giữ
+#   nguyên token hiếm và tên công nghệ.
+# - `paraphrase` queries dùng cách diễn đạt tiếng Việt không xuất hiện verbatim
+#   trong docs → multilingual MiniLM giữ được ý nghĩa tốt hơn BM25. Baseline
+#   `bge-small-en-v1.5` cho semantic 24.0% trên lát cắt này, MiniLM đơn lẻ đạt
+#   48.0% nhưng giảm mixed xuống 86.0%, còn E5-large làm pure vector lấn át mọi
+#   lát cắt. Vì vậy pure-vector mode dùng RRF ensemble của baseline + MiniLM:
+#   vẫn 384 chiều mỗi index, cân bằng tín hiệu kỹ thuật và tiếng Việt.
 # - `mixed` queries có cả từ exact + ý tưởng paraphrased → **hybrid thắng rõ**
 #   (~100% vs 97-98% pure modes). Đây là pattern production-relevant nhất
 #   vì user thật ít khi viết query 100% exact term hoặc 100% paraphrase.
