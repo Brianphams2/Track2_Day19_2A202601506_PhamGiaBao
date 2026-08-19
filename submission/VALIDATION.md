@@ -27,8 +27,9 @@ diễn từ output cũ.
 
 ## Kiểm tra hiện tại
 
-- `make test`: **35 passed, 8 skipped**.
-- `make verify-lite`: **chưa đạt** vì thiếu `data/corpus_vn.jsonl`; script yêu cầu chạy `make seed` trước.
+- `make seed`: **đạt**, sinh 1.000 tài liệu và 50 golden queries với seed 42.
+- `make verify-lite`: **đạt**, kết thúc với `All checks passed`.
+- `make test`: **43 passed, 0 failed, 0 skipped**.
 
-Vì vậy, output notebook là bằng chứng đã lưu, nhưng workspace hiện chưa đạt
-tính tái lập sạch máy cho đến khi sinh lại dữ liệu và chạy lại chuỗi kiểm tra.
+Hai tệp `data/corpus_vn.jsonl` và `data/golden_set.jsonl` được lưu trong repo
+để bộ smoke test và unit test có thể chạy ngay sau khi clone.
